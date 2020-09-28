@@ -1,16 +1,6 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.Linq;
-using System.Threading.Tasks;
-using Atlassian.Stash;
-using Atlassian.Stash.Entities;
-using LibGit2Sharp;
-using LibGit2Sharp.Handlers;
-using Microsoft.Alm.Authentication;
+﻿using System.Threading.Tasks;
 using Microsoft.Extensions.Configuration;
-using Octokit;
-using Credentials = Octokit.Credentials;
+using Serilog;
 
 namespace BitBucketMigrator
 {
@@ -18,11 +8,16 @@ namespace BitBucketMigrator
     {
         static async Task Main(string[] args)
         {
+            Log.Logger = new LoggerConfiguration()
+                .WriteTo.Console()
+                .CreateLogger();
+            
             IConfiguration config = new ConfigurationBuilder()
                 .AddJsonFile("appsettings.json", false, true)
                 .Build();
             var configuration = config.Get<MigrationConfiguration>();
             
+            Log.Information("Executing migrations");
             var migrator = new Migrator(configuration);
             await migrator.Migrate();
         }

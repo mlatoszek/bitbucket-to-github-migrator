@@ -6,6 +6,8 @@ using System.Threading.Tasks;
 using Atlassian.Stash;
 using LibGit2Sharp;
 using Octokit;
+using Polly;
+using Serilog;
 
 namespace BitBucketMigrator
 {
@@ -28,6 +30,8 @@ namespace BitBucketMigrator
                 _configuration.BitbucketPassword);
 
             var projects = await client.Projects.Get();
+            var allrepositoryNames = new HashSet<string>();
+            
             foreach (var project in projects.Values)
             {
                 var repositories = await client.Repositories.Get(project.Key);
@@ -44,6 +48,16 @@ namespace BitBucketMigrator
                         slug: x.Slug
                     )).ToList()
                 ));
+                foreach (var repository in repositories.Values)
+                {
+                    if (allrepositoryNames.Contains(repository.Name))
+                    {
+                        Log.Warning("Repository {repositoryName} from project {projectName} has non unique name and it needs to be migrated manually", repository.Name, project.Name);
+                        continue;
+                    }
+
+                    allrepositoryNames.Add(repository.Name);
+                }
             }
         }
 
@@ -51,13 +65,44 @@ namespace BitBucketMigrator
         {
             var githubClient = _clientFactory.GetOrCreateGithubClient();
             var existingRepositories = await githubClient.Repository.GetAllForOrg(_configuration.GithubOrganization);
-            var repoNamesSet = existingRepositories.Select(x => x.Name).ToHashSet();
-            foreach (var repository in migrateProjectParameters.Repositories.Where(x =>
-                !repoNamesSet.Contains(x.RepositoryName)))
+            var repositoriesDict = existingRepositories.ToDictionary(x => x.Name, x => x);
+            
+            foreach (var repository in migrateProjectParameters.Repositories)
             {
-                var githubRepo = await CreateGithubRepository(migrateProjectParameters, githubClient, repository);
-                MigrateRepository(repository, githubRepo);
-                repoNamesSet.Add(repository.RepositoryName);
+                if (repositoriesDict.ContainsKey(repository.RepositoryName))
+                {
+                    var githubRepo =
+                        repositoriesDict[repository.RepositoryName];
+                    
+                    if (githubRepo.Size > 0)
+                    {
+                        Log.Information(
+                            "Skipping repository {repositoryName} from project {projectName} as it already exist and contains code",
+                            repository.RepositoryName, migrateProjectParameters.ProjectName);
+                        continue;
+                    }
+                    
+                    Log.Information(
+                        "Migrating to existing repository {repositoryName} from project {projectName}",
+                        repository.RepositoryName, migrateProjectParameters.ProjectName);
+                    
+                    MigrateRepository(repository, githubRepo);
+                }
+                else
+                {
+                    try
+                    {
+                        var githubRepo =
+                            await CreateGithubRepository(migrateProjectParameters, githubClient, repository);
+                        MigrateRepository(repository, githubRepo);
+                    }
+                    catch (RepositoryExistsException)
+                    {
+                        Log.Information(
+                            "Skipping repository {repositoryName} from project {projectName} as it already exist",
+                            repository.RepositoryName, migrateProjectParameters.ProjectName);
+                    }
+                }
             }
         }
 
@@ -66,11 +111,11 @@ namespace BitBucketMigrator
             GitHubClient githubClient,
             Repository repository)
         {
+            Log.Information("Migrating repository {repositoryName} from project {projectName} to github", repository.RepositoryName, migrateProjectParameters.ProjectName);
             var githubRepo = await githubClient.Repository.Create(_configuration.GithubOrganization,
                 new NewRepository(repository.RepositoryName)
                 {
-                    Description = $"Migrated from {migrateProjectParameters.ProjectName} - {repository.RepositoryName}.\n" +
-                                  $"{migrateProjectParameters.Description}",
+                    Description = $"Migrated from {migrateProjectParameters.ProjectName} - {repository.RepositoryName}.",
                     Private = false
                 });
             return githubRepo;
@@ -79,35 +124,80 @@ namespace BitBucketMigrator
         private void MigrateRepository(Repository repository, Octokit.Repository githubRepo)
         {
             var clonePath = Path.Combine(_configuration.TempPath, repository.RepositoryName);
-            var cloneOptions = new CloneOptions
+
+            if (Directory.Exists(clonePath) && (Directory.GetFiles(clonePath).Length > 0 ||
+                                                Directory.GetDirectories(clonePath).Length > 0))
             {
-                CredentialsProvider = (url, user, cred) => new UsernamePasswordCredentials
+                using var localRepo = new LibGit2Sharp.Repository(clonePath);
+                Policy
+                    .Handle<LibGit2SharpException>(exception => exception.Message.Contains("Secure"))
+                    .WaitAndRetry(2, retryAttempt => 
+                        TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)) 
+                    )
+                    .Execute(() =>
+                    {
+                        Log.Information("Pushing to github");
+                        localRepo.Network.Push(localRepo.Branches, new PushOptions
+                        {
+                            CredentialsProvider = (url, user, cred) => new UsernamePasswordCredentials
+                            {
+                                Username = _configuration.GithubUsername,
+                                Password = _configuration.GithubToken
+                            },
+                        });
+                    });
+            }
+            else
+            {
+                var cloneOptions = new CloneOptions
                 {
-                    Username = _configuration.BitbucketUsername,
-                    Password = _configuration.BitbucketPassword
-                },
-            };
-            LibGit2Sharp.Repository.Clone(repository.CloneUrl.ToString(), clonePath, cloneOptions);
+                    CredentialsProvider = (url, user, cred) => new UsernamePasswordCredentials
+                    {
+                        Username = _configuration.BitbucketUsername,
+                        Password = _configuration.BitbucketPassword
+                    },
+                };
 
-            using var localRepo = new LibGit2Sharp.Repository(clonePath);
-            localRepo.Network.Remotes.Remove("origin");
-            var newRemote = localRepo.Network.Remotes.Add("origin", githubRepo.CloneUrl);
+                Policy
+                    .Handle<LibGit2SharpException>(exception => exception.Message.Contains("Secure"))
+                    .WaitAndRetry(5, retryAttempt =>
+                        TimeSpan.FromSeconds(Math.Pow(2, retryAttempt))
+                    ).Execute(() =>
+                    {
+                        Log.Information("Cloning from Bitbucket");
+                        return LibGit2Sharp.Repository.Clone(repository.CloneUrl.ToString(), clonePath, cloneOptions);
+                    });
+                
+                using var localRepo = new LibGit2Sharp.Repository(clonePath);
+                localRepo.Network.Remotes.Remove("origin");
+                var newRemote = localRepo.Network.Remotes.Add("origin", githubRepo.CloneUrl);
 
-            foreach (var localRepoBranch in localRepo.Branches)
-            {
-                localRepo.Branches.Update(localRepoBranch,
-                    b => b.Remote = newRemote.Name,
-                    b => b.UpstreamBranch = localRepoBranch.CanonicalName);
+                foreach (var localRepoBranch in localRepo.Branches)
+                {
+                    localRepo.Branches.Update(localRepoBranch,
+                        b => b.Remote = newRemote.Name,
+                        b => b.UpstreamBranch = localRepoBranch.CanonicalName);
+                }
+
+                Policy
+                    .Handle<LibGit2SharpException>(exception => exception.Message.Contains("Secure"))
+                    .WaitAndRetry(5, retryAttempt => 
+                        TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)) 
+                    )
+                    .Execute(() =>
+                    {
+                        Log.Information("Pushing to github");
+                        localRepo.Network.Push(localRepo.Branches, new PushOptions
+                        {
+                            CredentialsProvider = (url, user, cred) => new UsernamePasswordCredentials
+                            {
+                                Username = _configuration.GithubUsername,
+                                Password = _configuration.GithubToken
+                            },
+                        });
+                    });
             }
 
-            localRepo.Network.Push(localRepo.Branches, new PushOptions
-            {
-                CredentialsProvider = (url, user, cred) => new UsernamePasswordCredentials
-                {
-                    Username = _configuration.GithubUsername,
-                    Password = _configuration.GithubToken
-                },
-            });
         }
 
         class MigrateProjectParameters
